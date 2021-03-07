@@ -1,4 +1,4 @@
-module cwlogger
+module github.com/jwoffindin/cwlogger
 
 go 1.12
 
