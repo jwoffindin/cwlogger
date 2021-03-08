@@ -1,6 +1,7 @@
 package cwlogger
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -19,8 +20,7 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/endpoints"
-	"github.com/aws/aws-sdk-go-v2/aws/external"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/stretchr/testify/assert"
 )
@@ -174,6 +174,10 @@ func TestDataAlreadyAcceptedException(t *testing.T) {
 	logger := newLoggerWithServer(defaultConfig, func(w http.ResponseWriter, r *http.Request) {
 		if action(r) == "PutLogEvents" {
 			calls++
+
+			var data PutLogEvents
+			parseBody(r, &data)
+
 			if calls == 1 {
 				w.WriteHeader(http.StatusBadRequest)
 				w.Write([]byte(`
@@ -183,15 +187,13 @@ func TestDataAlreadyAcceptedException(t *testing.T) {
 					}
 				`))
 			} else {
-				var data PutLogEvents
-				parseBody(r, &data)
 				receivedSequenceToken = *data.SequenceToken
 				w.Write([]byte(`{"nextSequenceToken":"3"}`))
 			}
 		}
 	})
 
-	logChecker.Generate(logger, 2000)
+	logChecker.Generate(logger, 20)
 	logger.Close()
 
 	assert.Equal(t, 2, calls)
@@ -533,7 +535,7 @@ func TestConfigWithoutClient(t *testing.T) {
 
 func TestConfigWithoutLogGroupName(t *testing.T) {
 	logger, err := New(&Config{
-		Client: cloudwatchlogs.New(*aws.NewConfig()),
+		Client: cloudwatchlogs.NewFromConfig(*aws.NewConfig()),
 	})
 	assert.Nil(t, logger)
 	assert.EqualError(t, err, "cwlogger: config missing required LogGroupName")
@@ -565,14 +567,46 @@ type LogEvent struct {
 	Message   string `json:"message"`
 }
 
+type StaticCredentials struct{}
+
+// Retrieve implements the CredentialsProvider interface, but will always
+// return error, and cannot be used to sign a request. The AnonymousCredentials
+// type is used as a sentinel type instructing the AWS request signing
+// middleware to not sign a request.
+func (StaticCredentials) Retrieve(context.Context) (aws.Credentials, error) {
+	return aws.Credentials{Source: "StaticCredentials"}, nil
+}
+
 func newClientWithServer(handler http.HandlerFunc) *cloudwatchlogs.Client {
 	server := httptest.NewServer(http.HandlerFunc(handler))
-	cfg, _ := external.LoadDefaultAWSConfig()
-	cfg.Region = endpoints.UsEast1RegionID
-	cfg.EndpointResolver = aws.ResolveWithEndpointURL(server.URL)
-	cfg.Retryer = aws.DefaultRetryer{NumMaxRetries: 0}
-	cfg.Credentials = aws.NewStaticCredentialsProvider("id", "secret", "token")
-	return cloudwatchlogs.New(cfg)
+
+	customResolver := aws.EndpointResolverFunc(func(service, region string) (aws.Endpoint, error) {
+		return aws.Endpoint{URL: server.URL}, nil
+	})
+
+	customRetryer := func() aws.Retryer { return aws.NopRetryer{} }
+
+	cfg, err := config.LoadDefaultConfig(
+		context.TODO(),
+		config.WithEndpointResolver(customResolver),
+		config.WithCredentialsProvider(StaticCredentials{}),
+		config.WithRetryer(customRetryer),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	// return cloudwatchlogs.NewFromConfig(
+	// 	cfg,
+	// 	func(o *cloudwatchlogs.Options) {
+	// 		o.EndpointResolver = aws.EndpointResolverFunc(
+	// 			func(service, region string) (aws.Endpoint, error) {
+	// 				return aws.Endpoint{URL: server.URL}, nil
+	// 			},
+	// 		)
+	// 	},
+	// )
+	return cloudwatchlogs.NewFromConfig(cfg)
 }
 
 func newLoggerWithServer(config *Config, handler http.HandlerFunc) *Logger {

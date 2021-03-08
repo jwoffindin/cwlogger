@@ -4,16 +4,16 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"net/http"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/awserr"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	"github.com/sirupsen/logrus"
 )
 
 // The Config for the Logger.
@@ -105,7 +105,7 @@ func New(config *Config) (*Logger, error) {
 func (lg *Logger) Log(t time.Time, s string) {
 	lg.wg.Add(1)
 	go func() {
-		lg.batcher.input <- cloudwatchlogs.InputLogEvent{
+		lg.batcher.input <- types.InputLogEvent{
 			Message:   &s,
 			Timestamp: aws.Int64(t.UnixNano() / int64(time.Millisecond)),
 		}
@@ -136,30 +136,31 @@ func (lg *Logger) worker() {
 func (lg *Logger) createIfNotExists() error {
 	ctx := context.TODO()
 
-	req := lg.svc.CreateLogGroupRequest(&cloudwatchlogs.CreateLogGroupInput{
+	_, err := lg.svc.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{
 		LogGroupName: lg.name,
 	})
-
-	_, err := req.Send(ctx)
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			if awsErr.Code() == cloudwatchlogs.ErrCodeResourceAlreadyExistsException {
-				return nil
-			}
+		var existsErr *types.ResourceAlreadyExistsException
+		if errors.As(err, &existsErr) {
+			return nil
 		}
+		return fmt.Errorf("Unable to create log group %q: %w", *lg.name, err)
 	}
+
 	if lg.retention != 0 {
-		req := lg.svc.PutRetentionPolicyRequest(&cloudwatchlogs.PutRetentionPolicyInput{
+		_, err = lg.svc.PutRetentionPolicy(ctx, &cloudwatchlogs.PutRetentionPolicyInput{
 			LogGroupName:    lg.name,
-			RetentionInDays: aws.Int64(int64(lg.retention)),
+			RetentionInDays: aws.Int32(int32(lg.retention)),
 		})
-		_, err = req.Send(ctx)
+		if err != nil {
+			return fmt.Errorf("Unable to set log group retention: %w", err)
+		}
 	}
 	return err
 }
 
 type writeError struct {
-	batch  []cloudwatchlogs.InputLogEvent
+	batch  []types.InputLogEvent
 	stream *logStream
 	err    error
 }
@@ -167,8 +168,8 @@ type writeError struct {
 type logStreams struct {
 	logger  *Logger
 	streams []*logStream
-	writers map[*logStream]chan []cloudwatchlogs.InputLogEvent
-	writes  chan []cloudwatchlogs.InputLogEvent
+	writers map[*logStream]chan []types.InputLogEvent
+	writes  chan []types.InputLogEvent
 	errors  chan *writeError
 	wg      sync.WaitGroup
 }
@@ -177,8 +178,8 @@ func newLogStreams(lg *Logger) *logStreams {
 	streams := &logStreams{
 		logger:  lg,
 		streams: []*logStream{},
-		writers: make(map[*logStream]chan []cloudwatchlogs.InputLogEvent),
-		writes:  make(chan []cloudwatchlogs.InputLogEvent),
+		writers: make(map[*logStream]chan []types.InputLogEvent),
+		writes:  make(chan []types.InputLogEvent),
 		errors:  make(chan *writeError),
 	}
 	go streams.coordinator()
@@ -198,13 +199,13 @@ func (ls *logStreams) new() error {
 	}
 
 	ls.streams = append(ls.streams, stream)
-	ls.writers[stream] = make(chan []cloudwatchlogs.InputLogEvent)
+	ls.writers[stream] = make(chan []types.InputLogEvent)
 	go ls.writer(stream)
 
 	return nil
 }
 
-func (ls *logStreams) write(b []cloudwatchlogs.InputLogEvent) {
+func (ls *logStreams) write(b []types.InputLogEvent) {
 	ls.wg.Add(1)
 	go func() {
 		ls.writes <- b
@@ -268,51 +269,52 @@ type logStream struct {
 }
 
 func (ls *logStream) create() error {
-	req := ls.logger.svc.CreateLogStreamRequest(&cloudwatchlogs.CreateLogStreamInput{
-		LogGroupName:  ls.logger.name,
-		LogStreamName: ls.name,
-	})
-	_, err := req.Send(context.TODO())
+	_, err := ls.logger.svc.CreateLogStream(
+		context.TODO(),
+		&cloudwatchlogs.CreateLogStreamInput{
+			LogGroupName:  ls.logger.name,
+			LogStreamName: ls.name,
+		})
+
 	return err
 }
 
-func (ls *logStream) write(b []cloudwatchlogs.InputLogEvent) error {
-	req := ls.logger.svc.PutLogEventsRequest(&cloudwatchlogs.PutLogEventsInput{
+func (ls *logStream) write(b []types.InputLogEvent) error {
+	fmt.Printf("In put with %d events\b", len(b))
+
+	input := cloudwatchlogs.PutLogEventsInput{
 		LogGroupName:  ls.logger.name,
 		LogStreamName: ls.name,
 		LogEvents:     b,
 		SequenceToken: ls.sequenceToken,
-	})
+	}
 
-	req.Sign()
-	resp, err := ls.logger.svc.Client.Config.HTTPClient.Do(req.HTTPRequest)
-
+	resp, err := ls.logger.svc.PutLogEvents(
+		context.TODO(),
+		&input,
+	)
 	if err != nil {
+		var invalidToken *types.InvalidSequenceTokenException
+		if errors.As(err, &invalidToken) {
+			logrus.Warnf("Received invalid token sequence exception")
+			if invalidToken.ExpectedSequenceToken != nil {
+				ls.sequenceToken = invalidToken.ExpectedSequenceToken
+			}
+		} else {
+			var seen *types.DataAlreadyAcceptedException
+			if errors.As(err, &seen) {
+				logrus.Warnf("Received already accepted ")
+				if seen.ExpectedSequenceToken != nil {
+					ls.sequenceToken = seen.ExpectedSequenceToken
+				}
+			} else {
+				panic("unknown error" + err.Error())
+			}
+		}
 		return err
 	}
 
-	dec := json.NewDecoder(resp.Body)
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var data putLogEventsSuccessResponse
-		if err := dec.Decode(&data); err != nil {
-			return err
-		}
-		ls.sequenceToken = &data.NextSequenceToken
-	} else {
-		var data putLogEventsErrorResponse
-		if err := dec.Decode(&data); err != nil {
-			return err
-		}
-		if data.ExpectedSequenceToken != nil {
-			ls.sequenceToken = data.ExpectedSequenceToken
-		}
-		return Error{
-			Code:    data.Code,
-			Message: data.Message,
-		}
-	}
+	ls.sequenceToken = resp.NextSequenceToken
 
 	return nil
 }
